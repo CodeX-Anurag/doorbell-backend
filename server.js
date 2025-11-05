@@ -2,11 +2,9 @@ import express from "express";
 import mongoose from "mongoose";
 import multer from "multer";
 import cors from "cors";
+import dotenv from "dotenv";
 import http from "http";
 import { Server } from "socket.io";
-import fs from "fs";
-import path from "path";
-import dotenv from "dotenv";
 
 dotenv.config();
 
@@ -16,76 +14,92 @@ const io = new Server(server, {
   cors: { origin: "*" },
 });
 
-app.use(cors());
-app.use(express.json());
-app.use("/uploads", express.static("uploads")); // to serve images statically
+const PORT = process.env.PORT || 5000;
+const MONGO_URI = process.env.MONGO_URI;
 
-// --- MongoDB setup ---
+// --- Middleware ---
+app.use(cors());
+app.use(express.json({ limit: "10mb" })); // for base64 JSON uploads
+
+// --- MongoDB Setup ---
 mongoose
-  .connect(process.env.MONGO_URI, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true,
-  })
+  .connect(MONGO_URI)
   .then(() => console.log("✅ Connected to MongoDB"))
-  .catch((err) => console.error("MongoDB connection error:", err));
+  .catch((err) => console.error("❌ MongoDB connection failed:", err));
 
 // --- Schema ---
 const ImageSchema = new mongoose.Schema({
+  data: String, // base64 image
   filename: String,
-  filepath: String,
-  timestamp: { type: Date, default: Date.now },
+  uploadedAt: { type: Date, default: Date.now },
 });
 
 const Image = mongoose.model("Image", ImageSchema);
 
-// --- Multer setup ---
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, "uploads/"),
-  filename: (req, file, cb) =>
-    cb(null, Date.now() + "-" + file.originalname),
-});
-
+// --- Multer setup for form uploads (optional for testing) ---
+const storage = multer.memoryStorage();
 const upload = multer({ storage });
 
 // --- Routes ---
+app.get("/", (req, res) => res.send("📸 Doorbell API is running."));
 
-// 📤 Upload image
+// ✅ Upload endpoint (via base64 or file)
 app.post("/upload", upload.single("image"), async (req, res) => {
-  const image = new Image({
-    filename: req.file.originalname,
-    filepath: `/uploads/${req.file.filename}`,
-  });
-  await image.save();
+  try {
+    let imgData;
 
-  io.emit("new_image", image); // notify clients
-  res.json({ message: "Image uploaded", image });
+    if (req.file) {
+      // if uploaded as file
+      imgData = req.file.buffer.toString("base64");
+    } else {
+      // if uploaded via JSON
+      imgData = req.body.image;
+    }
+
+    const img = new Image({
+      filename: req.body.filename || `doorbell_${Date.now()}.png`,
+      data: imgData,
+    });
+
+    await img.save();
+
+    // Notify all connected clients
+    io.emit("new_image", {
+      id: img._id,
+      filename: img.filename,
+      uploadedAt: img.uploadedAt,
+    });
+
+    res.json({ success: true, id: img._id });
+  } catch (err) {
+    console.error("Upload error:", err);
+    res.status(500).json({ success: false, error: "Upload failed." });
+  }
 });
 
-// 📥 Get image list (metadata only)
+// ✅ Lightweight list (no base64)
 app.get("/images", async (req, res) => {
-  const images = await Image.find({}, "filename filepath timestamp").sort({ timestamp: -1 });
+  const images = await Image.find({}, { data: 0 }).sort({ uploadedAt: -1 });
   res.json(images);
 });
 
-// 📸 Get single image file
-app.get("/image/:id", async (req, res) => {
-  const img = await Image.findById(req.params.id);
-  if (!img) return res.status(404).send("Image not found");
-  res.sendFile(path.resolve(img.filepath));
+// ✅ Fetch one image (returns base64)
+app.get("/images/:id", async (req, res) => {
+  try {
+    const img = await Image.findById(req.params.id);
+    if (!img) return res.status(404).json({ error: "Not found" });
+    res.json({ filename: img.filename, data: img.data });
+  } catch {
+    res.status(400).json({ error: "Invalid ID" });
+  }
 });
 
-// 🔔 Doorbell trigger (e.g. ESP32 ping)
-app.post("/doorbell", (req, res) => {
-  io.emit("doorbell_pressed");
-  res.json({ message: "Doorbell pressed!" });
-});
-
-// --- WebSocket connection ---
+// --- Socket.IO connection ---
 io.on("connection", (socket) => {
-  console.log("Client connected:", socket.id);
-  socket.on("disconnect", () => console.log("Client disconnected:", socket.id));
+  console.log("🔔 Client connected:", socket.id);
+  socket.on("disconnect", () => console.log("❌ Client disconnected:", socket.id));
 });
 
-const PORT = process.env.PORT || 5000;
+// --- Start ---
 server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 

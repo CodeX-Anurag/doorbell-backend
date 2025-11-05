@@ -3,8 +3,6 @@ import mongoose from "mongoose";
 import multer from "multer";
 import cors from "cors";
 import dotenv from "dotenv";
-import path from "path";
-import { fileURLToPath } from "url";
 
 dotenv.config();
 
@@ -12,87 +10,67 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 const MONGO_URI = process.env.MONGO_URI;
 
-// For ES module path handling
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
 // --- Middleware ---
 app.use(cors());
-app.use(express.json());
-app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+app.use(express.json({ limit: "10mb" })); // allow large base64 payloads
 
-// --- MongoDB Setup ---
-if (!MONGO_URI) {
-  console.error("❌ MONGO_URI not set in environment variables");
-  process.exit(1);
-}
-
+// --- MongoDB Connection ---
 mongoose
   .connect(MONGO_URI)
   .then(() => console.log("✅ Connected to MongoDB"))
-  .catch((err) => {
-    console.error("❌ MongoDB connection failed:", err.message);
-    process.exit(1);
-  });
+  .catch((err) => console.error("❌ MongoDB connection failed:", err));
 
-// --- Mongoose Model ---
+// --- Schema ---
 const ImageSchema = new mongoose.Schema({
   filename: String,
-  path: String,
+  contentType: String,
+  data: Buffer,
   uploadedAt: { type: Date, default: Date.now },
 });
 
 const Image = mongoose.model("Image", ImageSchema);
 
-// --- Multer setup ---
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, "uploads/"),
-  filename: (req, file, cb) =>
-    cb(null, `${Date.now()}-${file.originalname.replace(/\s+/g, "_")}`),
-});
+// --- Multer (in-memory storage) ---
+const storage = multer.memoryStorage();
 const upload = multer({ storage });
 
 // --- Routes ---
-app.get("/", (req, res) => res.send("📸 Doorbell API is running."));
 
-app.get("/ping", (req, res) => res.json({ message: "pong" }));
+// health check
+app.get("/", (req, res) => res.send("📸 Doorbell API (MongoDB-storage) is running!"));
 
+// upload image (from ESP or frontend)
 app.post("/upload", upload.single("image"), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ success: false, error: "No file uploaded" });
-    }
-
-    const img = new Image({
-      filename: req.file.filename,
-      path: `/uploads/${req.file.filename}`,
+    const newImage = new Image({
+      filename: req.file.originalname,
+      contentType: req.file.mimetype,
+      data: req.file.buffer,
     });
-    await img.save();
-
-    res.json({
-      success: true,
-      image: {
-        id: img._id,
-        filename: img.filename,
-        url: `${req.protocol}://${req.get("host")}${img.path}`,
-      },
-    });
+    await newImage.save();
+    res.json({ success: true, message: "Image stored in MongoDB", id: newImage._id });
   } catch (err) {
-    console.error("❌ Upload failed:", err);
-    res.status(500).json({ success: false, error: "Upload failed." });
+    console.error(err);
+    res.status(500).json({ success: false, error: "Upload failed" });
   }
 });
 
+// list all images (metadata + base64)
 app.get("/images", async (req, res) => {
   try {
     const images = await Image.find().sort({ uploadedAt: -1 });
-    res.json(images);
+    const formatted = images.map((img) => ({
+      id: img._id,
+      filename: img.filename,
+      uploadedAt: img.uploadedAt,
+      base64: `data:${img.contentType};base64,${img.data.toString("base64")}`,
+    }));
+    res.json(formatted);
   } catch (err) {
-    console.error("❌ Fetch failed:", err);
-    res.status(500).json({ error: "Could not fetch images." });
+    console.error(err);
+    res.status(500).json({ success: false, error: "Failed to fetch images" });
   }
 });
 
-// --- Start server ---
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 
